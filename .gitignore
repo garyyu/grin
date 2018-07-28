@@ -1,10 +1,12 @@
 *.swp
 .DS_Store
 .grin*
+.idea/
 node*
 target
 Cargo.lock
 *.iml
 grin.log
 wallet.seed
+wallet_data/
 test_output
