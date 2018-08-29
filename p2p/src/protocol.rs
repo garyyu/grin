@@ -14,12 +14,14 @@
 
 use std::env;
 use std::fs::File;
+use std::io::BufWriter;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use conn::{Message, MessageHandler, Response};
 use core::core;
-use core::core::hash::{Hash, Hashed};
+use core::core::hash::Hash;
+use core::core::CompactBlock;
 use msg::{
 	BanReason, GetPeerAddrs, Headers, Locator, PeerAddrs, Ping, Pong, SockAddr, TxHashSetArchive,
 	TxHashSetRequest, Type,
@@ -83,12 +85,20 @@ impl MessageHandler for Protocol {
 			}
 
 			Type::Transaction => {
+				debug!(
+					LOGGER,
+					"handle_payload: received tx: msg_len: {}", msg.header.msg_len
+				);
 				let tx: core::Transaction = msg.body()?;
 				adapter.transaction_received(tx, false);
 				Ok(None)
 			}
 
 			Type::StemTransaction => {
+				debug!(
+					LOGGER,
+					"handle_payload: received stem tx: msg_len: {}", msg.header.msg_len
+				);
 				let tx: core::Transaction = msg.body()?;
 				adapter.transaction_received(tx, true);
 				Ok(None)
@@ -106,10 +116,11 @@ impl MessageHandler for Protocol {
 			}
 
 			Type::Block => {
+				debug!(
+					LOGGER,
+					"handle_payload: received block: msg_len: {}", msg.header.msg_len
+				);
 				let b: core::Block = msg.body()?;
-				let bh = b.hash();
-
-				trace!(LOGGER, "handle_payload: Block {}", bh);
 
 				adapter.block_received(b, self.addr);
 				Ok(None)
@@ -117,20 +128,15 @@ impl MessageHandler for Protocol {
 
 			Type::GetCompactBlock => {
 				let h: Hash = msg.body()?;
-				debug!(LOGGER, "handle_payload: GetCompactBlock: {}", h);
 
 				if let Some(b) = adapter.get_block(h) {
-					let cb = b.as_compact_block();
-
-					// serialize and send the block over in compact representation
-
 					// if we have txs in the block send a compact block
 					// but if block is empty -
 					// to allow us to test all code paths, randomly choose to send
 					// either the block or the compact block
 					let mut rng = rand::thread_rng();
 
-					if cb.kern_ids.is_empty() && rng.gen() {
+					if b.kernels().len() == 1 && rng.gen() {
 						debug!(
 							LOGGER,
 							"handle_payload: GetCompactBlock: empty block, sending full block",
@@ -138,6 +144,7 @@ impl MessageHandler for Protocol {
 
 						Ok(Some(msg.respond(Type::Block, b)))
 					} else {
+						let cb: CompactBlock = b.into();
 						Ok(Some(msg.respond(Type::CompactBlock, cb)))
 					}
 				} else {
@@ -146,9 +153,11 @@ impl MessageHandler for Protocol {
 			}
 
 			Type::CompactBlock => {
+				debug!(
+					LOGGER,
+					"handle_payload: received compact block: msg_len: {}", msg.header.msg_len
+				);
 				let b: core::CompactBlock = msg.body()?;
-				let bh = b.hash();
-				debug!(LOGGER, "handle_payload: CompactBlock: {}", bh);
 
 				adapter.compact_block_received(b, self.addr);
 				Ok(None)
@@ -246,9 +255,9 @@ impl MessageHandler for Protocol {
 				let mut tmp = env::temp_dir();
 				tmp.push("txhashset.zip");
 				let mut save_txhashset_to_file = |file| -> Result<(), Error> {
-					let mut tmp_zip = File::create(file)?;
+					let mut tmp_zip = BufWriter::new(File::create(file)?);
 					msg.copy_attachment(sm_arch.bytes as usize, &mut tmp_zip)?;
-					tmp_zip.sync_all()?;
+					tmp_zip.into_inner().unwrap().sync_all()?;
 					Ok(())
 				};
 

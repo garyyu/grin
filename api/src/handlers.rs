@@ -50,6 +50,32 @@ fn w<T>(weak: &Weak<T>) -> Arc<T> {
 	weak.upgrade().unwrap()
 }
 
+/// Retrieves an output from the chain given a commit id (a tiny bit iteratively)
+fn get_output(chain: &Weak<chain::Chain>, id: &str) -> Result<(Output, OutputIdentifier), Error> {
+	let c = util::from_hex(String::from(id)).context(ErrorKind::Argument(format!(
+		"Not a valid commitment: {}",
+		id
+	)))?;
+	let commit = Commitment::from_vec(c);
+
+	// We need the features here to be able to generate the necessary hash
+	// to compare against the hash in the output MMR.
+	// For now we can just try both (but this probably needs to be part of the api
+	// params)
+	let outputs = [
+		OutputIdentifier::new(OutputFeatures::DEFAULT_OUTPUT, &commit),
+		OutputIdentifier::new(OutputFeatures::COINBASE_OUTPUT, &commit),
+	];
+
+	for x in outputs.iter() {
+		if let Ok(_) = w(chain).is_unspent(&x) {
+			let block_height = w(chain).get_header_for_output(&x).unwrap().height;
+			return Ok((Output::new(&commit, block_height), x.clone()));
+		}
+	}
+	Err(ErrorKind::NotFound)?
+}
+
 // RESTful index of available api endpoints
 // GET /v1/
 struct IndexHandler {
@@ -74,32 +100,18 @@ struct OutputHandler {
 
 impl OutputHandler {
 	fn get_output(&self, id: &str) -> Result<Output, Error> {
-		let c = util::from_hex(String::from(id)).context(ErrorKind::Argument(format!(
-			"Not a valid commitment: {}",
-			id
-		)))?;
-		let commit = Commitment::from_vec(c);
-
-		// We need the features here to be able to generate the necessary hash
-		// to compare against the hash in the output MMR.
-		// For now we can just try both (but this probably needs to be part of the api
-		// params)
-		let outputs = [
-			OutputIdentifier::new(OutputFeatures::DEFAULT_OUTPUT, &commit),
-			OutputIdentifier::new(OutputFeatures::COINBASE_OUTPUT, &commit),
-		];
-
-		for x in outputs.iter() {
-			if let Ok(_) = w(&self.chain).is_unspent(&x) {
-				return Ok(Output::new(&commit));
-			}
-		}
-		Err(ErrorKind::NotFound)?
+		let res = get_output(&self.chain, id)?;
+		Ok(res.0)
 	}
 
-	fn outputs_by_ids(&self, req: &Request<Body>) -> Vec<Output> {
+	fn outputs_by_ids(&self, req: &Request<Body>) -> Result<Vec<Output>, Error> {
 		let mut commitments: Vec<String> = vec![];
-		let params = form_urlencoded::parse(req.uri().query().unwrap().as_bytes())
+
+		let query = match req.uri().query() {
+			Some(q) => q,
+			None => return Err(ErrorKind::RequestError("no query string".to_owned()))?,
+		};
+		let params = form_urlencoded::parse(query.as_bytes())
 			.into_owned()
 			.collect::<Vec<(String, String)>>();
 
@@ -111,15 +123,13 @@ impl OutputHandler {
 			}
 		}
 
-		debug!(LOGGER, "outputs_by_ids: {:?}", commitments);
-
 		let mut outputs: Vec<Output> = vec![];
 		for x in commitments {
 			if let Ok(output) = self.get_output(&x) {
 				outputs.push(output);
 			}
 		}
-		outputs
+		Ok(outputs)
 	}
 
 	fn outputs_at_height(
@@ -127,58 +137,50 @@ impl OutputHandler {
 		block_height: u64,
 		commitments: Vec<Commitment>,
 		include_proof: bool,
-	) -> BlockOutputs {
-		let header = w(&self.chain).get_header_by_height(block_height).unwrap();
+	) -> Result<BlockOutputs, Error> {
+		let header = w(&self.chain)
+			.get_header_by_height(block_height)
+			.map_err(|_| ErrorKind::NotFound)?;
 
 		// TODO - possible to compact away blocks we care about
 		// in the period between accepting the block and refreshing the wallet
-		if let Ok(block) = w(&self.chain).get_block(&header.hash()) {
-			let outputs = block
-				.outputs
-				.iter()
-				.filter(|output| commitments.is_empty() || commitments.contains(&output.commit))
-				.map(|output| {
-					OutputPrintable::from_output(
-						output,
-						w(&self.chain),
-						Some(&header),
-						include_proof,
-					)
-				})
-				.collect();
+		let block = w(&self.chain)
+			.get_block(&header.hash())
+			.map_err(|_| ErrorKind::NotFound)?;
+		let outputs = block
+			.outputs()
+			.iter()
+			.filter(|output| commitments.is_empty() || commitments.contains(&output.commit))
+			.map(|output| {
+				OutputPrintable::from_output(output, w(&self.chain), Some(&header), include_proof)
+			})
+			.collect();
 
-			BlockOutputs {
-				header: BlockHeaderInfo::from_header(&header),
-				outputs: outputs,
-			}
-		} else {
-			debug!(
-				LOGGER,
-				"could not find block {:?} at height {}, maybe compacted?",
-				&header.hash(),
-				block_height,
-			);
-
-			BlockOutputs {
-				header: BlockHeaderInfo::from_header(&header),
-				outputs: vec![],
-			}
-		}
+		Ok(BlockOutputs {
+			header: BlockHeaderInfo::from_header(&header),
+			outputs: outputs,
+		})
 	}
 
 	// returns outputs for a specified range of blocks
-	fn outputs_block_batch(&self, req: &Request<Body>) -> Vec<BlockOutputs> {
+	fn outputs_block_batch(&self, req: &Request<Body>) -> Result<Vec<BlockOutputs>, Error> {
 		let mut commitments: Vec<Commitment> = vec![];
 		let mut start_height = 1;
 		let mut end_height = 1;
 		let mut include_rp = false;
 
-		let params = form_urlencoded::parse(req.uri().query().unwrap().as_bytes())
-			.into_owned()
-			.fold(HashMap::new(), |mut hm, (k, v)| {
+		let query = match req.uri().query() {
+			Some(q) => q,
+			None => return Err(ErrorKind::RequestError("no query string".to_owned()))?,
+		};
+
+		let params = form_urlencoded::parse(query.as_bytes()).into_owned().fold(
+			HashMap::new(),
+			|mut hm, (k, v)| {
 				hm.entry(k).or_insert(vec![]).push(v);
 				hm
-			});
+			},
+		);
 
 		if let Some(ids) = params.get("id") {
 			for id in ids {
@@ -191,12 +193,16 @@ impl OutputHandler {
 		}
 		if let Some(heights) = params.get("start_height") {
 			for height in heights {
-				start_height = height.parse().unwrap();
+				start_height = height
+					.parse()
+					.map_err(|_| ErrorKind::RequestError("invalid start_height".to_owned()))?;
 			}
 		}
 		if let Some(heights) = params.get("end_height") {
 			for height in heights {
-				end_height = height.parse().unwrap();
+				end_height = height
+					.parse()
+					.map_err(|_| ErrorKind::RequestError("invalid end_height".to_owned()))?;
 			}
 		}
 		if let Some(_) = params.get("include_rp") {
@@ -214,27 +220,26 @@ impl OutputHandler {
 
 		let mut return_vec = vec![];
 		for i in (start_height..=end_height).rev() {
-			let res = self.outputs_at_height(i, commitments.clone(), include_rp);
-			if res.outputs.len() > 0 {
-				return_vec.push(res);
+			if let Ok(res) = self.outputs_at_height(i, commitments.clone(), include_rp) {
+				if res.outputs.len() > 0 {
+					return_vec.push(res);
+				}
 			}
 		}
 
-		return_vec
+		Ok(return_vec)
 	}
 }
 
 impl Handler for OutputHandler {
 	fn get(&self, req: Request<Body>) -> ResponseFuture {
-		match req.uri()
-			.path()
-			.trim_right_matches("/")
-			.rsplit("/")
-			.next()
-			.unwrap()
-		{
-			"byids" => json_response(&self.outputs_by_ids(&req)),
-			"byheight" => json_response(&self.outputs_block_batch(&req)),
+		let command = match req.uri().path().trim_right_matches("/").rsplit("/").next() {
+			Some(c) => c,
+			None => return response(StatusCode::BAD_REQUEST, "invalid url"),
+		};
+		match command {
+			"byids" => result_to_response(self.outputs_by_ids(&req)),
+			"byheight" => result_to_response(self.outputs_block_batch(&req)),
 			_ => response(StatusCode::BAD_REQUEST, ""),
 		}
 	}
@@ -281,15 +286,15 @@ impl TxHashSetHandler {
 	}
 
 	// allows traversal of utxo set
-	fn outputs(&self, start_index: u64, mut max: u64) -> OutputListing {
+	fn outputs(&self, start_index: u64, mut max: u64) -> Result<OutputListing, Error> {
 		//set a limit here
 		if max > 1000 {
 			max = 1000;
 		}
 		let outputs = w(&self.chain)
 			.unspent_outputs_by_insertion_index(start_index, max)
-			.unwrap();
-		OutputListing {
+			.context(ErrorKind::NotFound)?;
+		Ok(OutputListing {
 			last_retrieved_index: outputs.0,
 			highest_index: outputs.1,
 			outputs: outputs
@@ -297,7 +302,7 @@ impl TxHashSetHandler {
 				.iter()
 				.map(|x| OutputPrintable::from_output(x, w(&self.chain), None, true))
 				.collect(),
-		}
+		})
 	}
 
 	// return a dummy output with merkle proof for position filled out
@@ -308,13 +313,15 @@ impl TxHashSetHandler {
 			id
 		)))?;
 		let commit = Commitment::from_vec(c);
-		let merkle_proof = chain::Chain::get_merkle_proof_for_pos(&w(&self.chain), commit).unwrap();
+		let merkle_proof = chain::Chain::get_merkle_proof_for_pos(&w(&self.chain), commit)
+			.map_err(|_| ErrorKind::NotFound)?;
 		Ok(OutputPrintable {
 			output_type: OutputType::Coinbase,
 			commit: Commitment::from_vec(vec![]),
 			spent: false,
 			proof: None,
 			proof_hash: "".to_string(),
+			block_height: None,
 			merkle_proof: Some(merkle_proof),
 		})
 	}
@@ -362,20 +369,25 @@ impl Handler for TxHashSetHandler {
 				}
 			}
 		}
-		match req.uri()
+		let command = match req
+			.uri()
 			.path()
 			.trim_right()
 			.trim_right_matches("/")
 			.rsplit("/")
 			.next()
-			.unwrap()
 		{
+			Some(c) => c,
+			None => return response(StatusCode::BAD_REQUEST, "invalid url"),
+		};
+
+		match command {
 			"roots" => json_response_pretty(&self.get_roots()),
 			"lastoutputs" => json_response_pretty(&self.get_last_n_output(last_n)),
 			"lastrangeproofs" => json_response_pretty(&self.get_last_n_rangeproof(last_n)),
 			"lastkernels" => json_response_pretty(&self.get_last_n_kernel(last_n)),
-			"outputs" => json_response_pretty(&self.outputs(start_index, max)),
-			"merkleproof" => json_response_pretty(&self.get_merkle_proof_for_output(&id).unwrap()),
+			"outputs" => result_to_response(self.outputs(start_index, max)),
+			"merkleproof" => result_to_response(self.get_merkle_proof_for_output(&id)),
 			_ => response(StatusCode::BAD_REQUEST, ""),
 		}
 	}
@@ -418,46 +430,48 @@ pub struct PeerHandler {
 
 impl Handler for PeerHandler {
 	fn get(&self, req: Request<Body>) -> ResponseFuture {
-		if let Ok(addr) = req.uri()
-			.path()
-			.trim_right_matches("/")
-			.rsplit("/")
-			.next()
-			.unwrap()
-			.parse()
-		{
+		let command = match req.uri().path().trim_right_matches("/").rsplit("/").next() {
+			Some(c) => c,
+			None => return response(StatusCode::BAD_REQUEST, "invalid url"),
+		};
+		if let Ok(addr) = command.parse() {
 			match w(&self.peers).get_peer(addr) {
 				Ok(peer) => json_response(&peer),
-				Err(_) => response(StatusCode::BAD_REQUEST, ""),
+				Err(_) => response(StatusCode::NOT_FOUND, "peer not found"),
 			}
 		} else {
 			response(
 				StatusCode::BAD_REQUEST,
-				format!("url unrecognized: {}", req.uri().path()),
+				format!("peer address unrecognized: {}", req.uri().path()),
 			)
 		}
 	}
 	fn post(&self, req: Request<Body>) -> ResponseFuture {
 		let mut path_elems = req.uri().path().trim_right_matches("/").rsplit("/");
-		match path_elems.next().unwrap() {
-			"ban" => {
-				if let Ok(addr) = path_elems.next().unwrap().parse() {
-					w(&self.peers).ban_peer(&addr, ReasonForBan::ManualBan);
-					response(StatusCode::OK, "")
-				} else {
-					response(StatusCode::BAD_REQUEST, "bad address to ban")
+		let command = match path_elems.next() {
+			None => return response(StatusCode::BAD_REQUEST, "invalid url"),
+			Some(c) => c,
+		};
+		let addr = match path_elems.next() {
+			None => return response(StatusCode::BAD_REQUEST, "invalid url"),
+			Some(a) => match a.parse() {
+				Err(e) => {
+					return response(
+						StatusCode::BAD_REQUEST,
+						format!("invalid peer address: {}", e),
+					)
 				}
-			}
-			"unban" => {
-				if let Ok(addr) = path_elems.next().unwrap().parse() {
-					w(&self.peers).unban_peer(&addr);
-					response(StatusCode::OK, "")
-				} else {
-					response(StatusCode::BAD_REQUEST, "bad address to unban")
-				}
-			}
-			_ => response(StatusCode::BAD_REQUEST, "unrecognized command"),
-		}
+				Ok(addr) => addr,
+			},
+		};
+
+		match command {
+			"ban" => w(&self.peers).ban_peer(&addr, ReasonForBan::ManualBan),
+			"unban" => w(&self.peers).unban_peer(&addr),
+			_ => return response(StatusCode::BAD_REQUEST, "invalid command"),
+		};
+
+		response(StatusCode::OK, "")
 	}
 }
 
@@ -469,14 +483,20 @@ pub struct StatusHandler {
 }
 
 impl StatusHandler {
-	fn get_status(&self) -> Status {
-		Status::from_tip_and_peers(w(&self.chain).head().unwrap(), w(&self.peers).peer_count())
+	fn get_status(&self) -> Result<Status, Error> {
+		let head = w(&self.chain)
+			.head()
+			.map_err(|e| ErrorKind::Internal(format!("can't get head: {}", e)))?;
+		Ok(Status::from_tip_and_peers(
+			head,
+			w(&self.peers).peer_count(),
+		))
 	}
 }
 
 impl Handler for StatusHandler {
 	fn get(&self, _req: Request<Body>) -> ResponseFuture {
-		json_response(&self.get_status())
+		result_to_response(self.get_status())
 	}
 }
 
@@ -487,14 +507,17 @@ pub struct ChainHandler {
 }
 
 impl ChainHandler {
-	fn get_tip(&self) -> Tip {
-		Tip::from_tip(w(&self.chain).head().unwrap())
+	fn get_tip(&self) -> Result<Tip, Error> {
+		let head = w(&self.chain)
+			.head()
+			.map_err(|e| ErrorKind::Internal(format!("can't get head: {}", e)))?;
+		Ok(Tip::from_tip(head))
 	}
 }
 
 impl Handler for ChainHandler {
 	fn get(&self, _req: Request<Body>) -> ResponseFuture {
-		json_response(&self.get_tip())
+		result_to_response(self.get_tip())
 	}
 }
 
@@ -507,8 +530,13 @@ pub struct ChainValidationHandler {
 impl Handler for ChainValidationHandler {
 	fn get(&self, _req: Request<Body>) -> ResponseFuture {
 		// TODO - read skip_rproofs from query params
-		w(&self.chain).validate(true).unwrap();
-		response(StatusCode::OK, "")
+		match w(&self.chain).validate(true) {
+			Ok(_) => response(StatusCode::OK, ""),
+			Err(e) => response(
+				StatusCode::INTERNAL_SERVER_ERROR,
+				format!("validate failed: {}", e),
+			),
+		}
 	}
 }
 
@@ -521,14 +549,20 @@ pub struct ChainCompactHandler {
 
 impl Handler for ChainCompactHandler {
 	fn get(&self, _req: Request<Body>) -> ResponseFuture {
-		w(&self.chain).compact().unwrap();
-		response(StatusCode::OK, "")
+		match w(&self.chain).compact() {
+			Ok(_) => response(StatusCode::OK, ""),
+			Err(e) => response(
+				StatusCode::INTERNAL_SERVER_ERROR,
+				format!("compact failed: {}", e),
+			),
+		}
 	}
 }
 
-/// Gets block headers given either a hash or height.
+/// Gets block headers given either a hash or height or an output commit.
 /// GET /v1/headers/<hash>
 /// GET /v1/headers/<height>
+/// GET /v1/headers/<output commit>
 ///
 pub struct HeaderHandler {
 	pub chain: Weak<chain::Chain>,
@@ -536,6 +570,10 @@ pub struct HeaderHandler {
 
 impl HeaderHandler {
 	fn get_header(&self, input: String) -> Result<BlockHeaderPrintable, Error> {
+		// will fail quick if the provided isn't a commitment
+		if let Ok(h) = self.get_header_for_output(input.clone()) {
+			return Ok(h);
+		}
 		if let Ok(height) = input.parse() {
 			match w(&self.chain).get_header_by_height(height) {
 				Ok(header) => return Ok(BlockHeaderPrintable::from_header(&header)),
@@ -543,18 +581,28 @@ impl HeaderHandler {
 			}
 		}
 		check_block_param(&input)?;
-		let vec = util::from_hex(input).unwrap();
+		let vec = util::from_hex(input)
+			.map_err(|e| ErrorKind::Argument(format!("invalid input: {}", e)))?;
 		let h = Hash::from_vec(&vec);
 		let header = w(&self.chain)
 			.get_block_header(&h)
 			.context(ErrorKind::NotFound)?;
 		Ok(BlockHeaderPrintable::from_header(&header))
 	}
+
+	fn get_header_for_output(&self, commit_id: String) -> Result<BlockHeaderPrintable, Error> {
+		let oid = get_output(&self.chain, &commit_id)?.1;
+		match w(&self.chain).get_header_for_output(&oid) {
+			Ok(header) => return Ok(BlockHeaderPrintable::from_header(&header)),
+			Err(_) => return Err(ErrorKind::NotFound)?,
+		}
+	}
 }
 
-/// Gets block details given either a hash or height.
+/// Gets block details given either a hash or an unspent commit
 /// GET /v1/blocks/<hash>
 /// GET /v1/blocks/<height>
+/// GET /v1/blocks/<commit>
 ///
 /// Optionally return results as "compact blocks" by passing "?compact" query
 /// param GET /v1/blocks/<hash>?compact
@@ -571,7 +619,7 @@ impl BlockHandler {
 	fn get_compact_block(&self, h: &Hash) -> Result<CompactBlockPrintable, Error> {
 		let block = w(&self.chain).get_block(h).context(ErrorKind::NotFound)?;
 		Ok(CompactBlockPrintable::from_compact_block(
-			&block.as_compact_block(),
+			&block.into(),
 			w(&self.chain),
 		))
 	}
@@ -585,7 +633,8 @@ impl BlockHandler {
 			}
 		}
 		check_block_param(&input)?;
-		let vec = util::from_hex(input).unwrap();
+		let vec = util::from_hex(input)
+			.map_err(|e| ErrorKind::Argument(format!("invalid input: {}", e)))?;
 		Ok(Hash::from_vec(&vec))
 	}
 }
@@ -604,81 +653,52 @@ fn check_block_param(input: &String) -> Result<(), Error> {
 
 impl Handler for BlockHandler {
 	fn get(&self, req: Request<Body>) -> ResponseFuture {
-		let el = req.uri()
-			.path()
-			.trim_right_matches("/")
-			.rsplit("/")
-			.next()
-			.unwrap();
+		let el = match req.uri().path().trim_right_matches("/").rsplit("/").next() {
+			None => return response(StatusCode::BAD_REQUEST, "invalid url"),
+			Some(el) => el,
+		};
 
-		let h = self.parse_input(el.to_string());
-		if h.is_err() {
-			error!(LOGGER, "block_handler: bad parameter {}", el.to_string());
-			return response(StatusCode::BAD_REQUEST, "");
-		}
-
-		let h = h.unwrap();
+		let h = match self.parse_input(el.to_string()) {
+			Err(e) => {
+				return response(
+					StatusCode::BAD_REQUEST,
+					format!("failed to parse input: {}", e),
+				)
+			}
+			Ok(h) => h,
+		};
 
 		if let Some(param) = req.uri().query() {
 			if param == "compact" {
-				match self.get_compact_block(&h) {
-					Ok(b) => json_response(&b),
-					Err(_) => {
-						error!(LOGGER, "block_handler: can not get compact block {}", h);
-						response(StatusCode::INTERNAL_SERVER_ERROR, "")
-					}
-				}
+				result_to_response(self.get_compact_block(&h))
 			} else {
-				debug!(
-					LOGGER,
-					"block_handler: unsupported query parameter {}", param
-				);
-				response(StatusCode::BAD_REQUEST, "")
+				response(
+					StatusCode::BAD_REQUEST,
+					format!("unsupported query parameter: {}", param),
+				)
 			}
 		} else {
-			match self.get_block(&h) {
-				Ok(b) => json_response(&b),
-				Err(_) => {
-					error!(LOGGER, "block_handler: can not get block {}", h);
-					response(StatusCode::INTERNAL_SERVER_ERROR, "")
-				}
-			}
+			result_to_response(self.get_block(&h))
 		}
 	}
 }
 
 impl Handler for HeaderHandler {
 	fn get(&self, req: Request<Body>) -> ResponseFuture {
-		let el = req.uri()
-			.path()
-			.trim_right_matches("/")
-			.rsplit("/")
-			.next()
-			.unwrap();
-
-		match self.get_header(el.to_string()) {
-			Ok(h) => json_response(&h),
-			Err(_) => {
-				error!(
-					LOGGER,
-					"header_handler: can not get header {}",
-					el.to_string()
-				);
-				response(StatusCode::INTERNAL_SERVER_ERROR, "")
-			}
-		}
+		let el = match req.uri().path().trim_right_matches("/").rsplit("/").next() {
+			None => return response(StatusCode::BAD_REQUEST, "invalid url"),
+			Some(el) => el,
+		};
+		result_to_response(self.get_header(el.to_string()))
 	}
 }
 
 // Get basic information about the transaction pool.
-struct PoolInfoHandler<T> {
-	tx_pool: Weak<RwLock<pool::TransactionPool<T>>>,
+struct PoolInfoHandler {
+	tx_pool: Weak<RwLock<pool::TransactionPool>>,
 }
 
-impl<T> Handler for PoolInfoHandler<T>
-where
-	T: pool::BlockChain + Send + Sync,
-{
+impl Handler for PoolInfoHandler {
 	fn get(&self, _req: Request<Body>) -> ResponseFuture {
 		let pool_arc = w(&self.tx_pool);
 		let pool = pool_arc.read().unwrap();
@@ -696,14 +716,11 @@ struct TxWrapper {
 }
 
 // Push new transaction to our local transaction pool.
-struct PoolPushHandler<T> {
-	tx_pool: Weak<RwLock<pool::TransactionPool<T>>>,
+struct PoolPushHandler {
+	tx_pool: Weak<RwLock<pool::TransactionPool>>,
 }
 
-impl<T> PoolPushHandler<T>
-where
-	T: pool::BlockChain + Send + Sync + 'static,
-{
+impl PoolPushHandler {
 	fn update_pool(&self, req: Request<Body>) -> Box<Future<Item = (), Error = Error> + Send> {
 		let params = match req.uri().query() {
 			Some(query_string) => form_urlencoded::parse(query_string.as_bytes())
@@ -735,30 +752,38 @@ where
 					};
 					info!(
 						LOGGER,
-						"Pushing transaction with {} inputs and {} outputs to pool.",
-						tx.inputs.len(),
-						tx.outputs.len()
+						"Pushing transaction {} to pool (inputs: {}, outputs: {}, kernels: {})",
+						tx.hash(),
+						tx.inputs().len(),
+						tx.outputs().len(),
+						tx.kernels().len(),
 					);
 
 					//  Push to tx pool.
 					let mut tx_pool = pool_arc.write().unwrap();
+					let header = tx_pool.blockchain.chain_head().unwrap();
 					tx_pool
-						.add_to_pool(source, tx, !fluff)
-						.map_err(|_| ErrorKind::RequestError("Bad request".to_owned()).into())
+						.add_to_pool(source, tx, !fluff, &header.hash())
+						.map_err(|e| {
+							error!(LOGGER, "update_pool: failed with error: {:?}", e);
+							ErrorKind::RequestError("Bad request".to_owned()).into()
+						})
 				}),
 		)
 	}
 }
 
-impl<T> Handler for PoolPushHandler<T>
-where
-	T: pool::BlockChain + Send + Sync + 'static,
-{
+impl Handler for PoolPushHandler {
 	fn post(&self, req: Request<Body>) -> ResponseFuture {
 		Box::new(
 			self.update_pool(req)
 				.and_then(|_| ok(just_response(StatusCode::OK, "")))
-				.or_else(|_| ok(just_response(StatusCode::BAD_REQUEST, ""))),
+				.or_else(|e| {
+					ok(just_response(
+						StatusCode::INTERNAL_SERVER_ERROR,
+						format!("failed: {}", e),
+					))
+				}),
 		)
 	}
 }
@@ -775,6 +800,24 @@ where
 	}
 }
 
+fn result_to_response<T>(res: Result<T, Error>) -> ResponseFuture
+where
+	T: Serialize,
+{
+	match res {
+		Ok(s) => json_response_pretty(&s),
+		Err(e) => match e.kind() {
+			ErrorKind::Argument(msg) => response(StatusCode::BAD_REQUEST, msg.clone()),
+			ErrorKind::RequestError(msg) => response(StatusCode::BAD_REQUEST, msg.clone()),
+			ErrorKind::NotFound => response(StatusCode::NOT_FOUND, ""),
+			ErrorKind::Internal(msg) => response(StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
+			ErrorKind::ResponseError(msg) => {
+				response(StatusCode::INTERNAL_SERVER_ERROR, msg.clone())
+			}
+		},
+	}
+}
+
 // pretty-printed version of above
 fn json_response_pretty<T>(s: &T) -> ResponseFuture
 where
@@ -782,7 +825,10 @@ where
 {
 	match serde_json::to_string_pretty(s) {
 		Ok(json) => response(StatusCode::OK, json),
-		Err(_) => response(StatusCode::INTERNAL_SERVER_ERROR, ""),
+		Err(e) => response(
+			StatusCode::INTERNAL_SERVER_ERROR,
+			format!("can't create json response: {}", e),
+		),
 	}
 }
 
@@ -791,7 +837,6 @@ fn response<T: Into<Body> + Debug>(status: StatusCode, text: T) -> ResponseFutur
 }
 
 fn just_response<T: Into<Body> + Debug>(status: StatusCode, text: T) -> Response<Body> {
-	debug!(LOGGER, "HTTP API -> status: {}, text: {:?}", status, text);
 	let mut resp = Response::new(text.into());
 	*resp.status_mut() = status;
 	resp
@@ -807,14 +852,12 @@ thread_local!( static ROUTER: RefCell<Option<Router>> = RefCell::new(None) );
 /// weak references. Note that this likely means a crash if the handlers are
 /// used after a server shutdown (which should normally never happen,
 /// except during tests).
-pub fn start_rest_apis<T>(
+pub fn start_rest_apis(
 	addr: String,
 	chain: Weak<chain::Chain>,
-	tx_pool: Weak<RwLock<pool::TransactionPool<T>>>,
+	tx_pool: Weak<RwLock<pool::TransactionPool>>,
 	peers: Weak<p2p::Peers>,
-) where
-	T: pool::BlockChain + Send + Sync + 'static,
-{
+) {
 	let _ = thread::Builder::new()
 		.name("apis".to_string())
 		.spawn(move || {
@@ -858,14 +901,11 @@ where
 	)
 }
 
-pub fn build_router<T>(
+pub fn build_router(
 	chain: Weak<chain::Chain>,
-	tx_pool: Weak<RwLock<pool::TransactionPool<T>>>,
+	tx_pool: Weak<RwLock<pool::TransactionPool>>,
 	peers: Weak<p2p::Peers>,
-) -> Result<Router, RouterError>
-where
-	T: pool::BlockChain + Send + Sync + 'static,
-{
+) -> Result<Router, RouterError> {
 	let route_list = vec![
 		"get blocks".to_string(),
 		"get chain".to_string(),

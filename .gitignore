@@ -10,3 +10,4 @@ grin.log
 wallet.seed
 wallet_data/
 test_output
+wallet_data

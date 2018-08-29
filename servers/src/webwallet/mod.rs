@@ -12,17 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! lower-level wallet functions which build upon libtx to perform wallet
-//! operations
+//! Web wallet application static file server
 
-#![deny(non_upper_case_globals)]
-#![deny(non_camel_case_types)]
-#![deny(non_snake_case)]
-#![deny(unused_mut)]
-#![warn(missing_docs)]
-
-pub mod keys;
-pub mod restore;
-pub mod selection;
-pub mod tx;
-pub mod updater;
+pub mod server;

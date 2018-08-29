@@ -13,7 +13,6 @@
 // limitations under the License.
 
 /// Wallet commands processing
-
 use std::process::exit;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -23,9 +22,10 @@ use clap::ArgMatches;
 
 use config::GlobalConfig;
 use core::core;
-use grin_wallet::{self, libwallet, controller, display};
+use grin_wallet::{self, controller, display, libwallet};
 use grin_wallet::{HTTPWalletClient, LMDBBackend, WalletConfig, WalletInst, WalletSeed};
 use keychain;
+use servers::start_webwallet_server;
 use util::LOGGER;
 
 pub fn init_wallet_seed(wallet_config: WalletConfig) {
@@ -132,6 +132,16 @@ pub fn wallet_command(wallet_args: &ArgMatches, global_config: GlobalConfig) {
 					)
 				});
 			}
+			("web", Some(_api_args)) => {
+				// start owner listener and run static file server
+				start_webwallet_server();
+				controller::owner_listener(wallet, "127.0.0.1:13420").unwrap_or_else(|e| {
+					panic!(
+						"Error creating wallet api listener: {:?} Config: {:?}",
+						e, wallet_config
+					)
+				});
+			}
 			_ => {}
 		};
 	}
@@ -160,6 +170,11 @@ pub fn wallet_command(wallet_args: &ArgMatches, global_config: GlobalConfig) {
 				let dest = send_args
 					.value_of("dest")
 					.expect("Destination wallet address required");
+				let change_outputs = send_args
+					.value_of("change_outputs")
+					.unwrap()
+					.parse()
+					.expect("Failed to parse number of change outputs.");
 				let fluff = send_args.is_present("fluff");
 				let max_outputs = 500;
 				if dest.starts_with("http") {
@@ -168,6 +183,7 @@ pub fn wallet_command(wallet_args: &ArgMatches, global_config: GlobalConfig) {
 						minimum_confirmations,
 						dest,
 						max_outputs,
+						change_outputs,
 						selection_strategy == "all",
 					);
 					let slate = match result {
@@ -175,7 +191,7 @@ pub fn wallet_command(wallet_args: &ArgMatches, global_config: GlobalConfig) {
 							info!(
 								LOGGER,
 								"Tx created: {} grin to {} (strategy '{}')",
-								core::amount_to_hr_string(amount),
+								core::amount_to_hr_string(amount, false),
 								dest,
 								selection_strategy,
 							);
@@ -213,6 +229,7 @@ pub fn wallet_command(wallet_args: &ArgMatches, global_config: GlobalConfig) {
 						minimum_confirmations,
 						dest,
 						max_outputs,
+						change_outputs,
 						selection_strategy == "all",
 					).expect("Send failed");
 					Ok(())
@@ -230,10 +247,7 @@ pub fn wallet_command(wallet_args: &ArgMatches, global_config: GlobalConfig) {
 				let tx_file = send_args
 					.value_of("input")
 					.expect("Receiver's transaction file required");
-				let priv_file = send_args
-					.value_of("private")
-					.expect("Private transaction file required");
-				let slate = api.file_finalize_tx(priv_file, tx_file).expect("Finalize failed");
+				let slate = api.file_finalize_tx(tx_file).expect("Finalize failed");
 
 				let result = api.post_tx(&slate, fluff);
 				match result {
@@ -279,13 +293,12 @@ pub fn wallet_command(wallet_args: &ArgMatches, global_config: GlobalConfig) {
 			("outputs", Some(_)) => {
 				let (height, _) = api.node_height()?;
 				let (validated, outputs) = api.retrieve_outputs(show_spent, true, None)?;
-				let _res =
-					display::outputs(height, validated, outputs).unwrap_or_else(|e| {
-						panic!(
-							"Error getting wallet outputs: {:?} Config: {:?}",
-							e, wallet_config
-						)
-					});
+				let _res = display::outputs(height, validated, outputs).unwrap_or_else(|e| {
+					panic!(
+						"Error getting wallet outputs: {:?} Config: {:?}",
+						e, wallet_config
+					)
+				});
 				Ok(())
 			}
 			("txs", Some(txs_args)) => {
@@ -299,8 +312,8 @@ pub fn wallet_command(wallet_args: &ArgMatches, global_config: GlobalConfig) {
 				let (height, _) = api.node_height()?;
 				let (validated, txs) = api.retrieve_txs(true, tx_id)?;
 				let include_status = !tx_id.is_some();
-				let _res = display::txs(height, validated, txs, include_status)
-					.unwrap_or_else(|e| {
+				let _res =
+					display::txs(height, validated, txs, include_status).unwrap_or_else(|e| {
 						panic!(
 							"Error getting wallet outputs: {} Config: {:?}",
 							e, wallet_config
@@ -310,13 +323,12 @@ pub fn wallet_command(wallet_args: &ArgMatches, global_config: GlobalConfig) {
 				// inputs/outputs
 				if tx_id.is_some() {
 					let (_, outputs) = api.retrieve_outputs(true, false, tx_id)?;
-					let _res =
-						display::outputs(height, validated, outputs).unwrap_or_else(|e| {
-							panic!(
-								"Error getting wallet outputs: {} Config: {:?}",
-								e, wallet_config
-							)
-						});
+					let _res = display::outputs(height, validated, outputs).unwrap_or_else(|e| {
+						panic!(
+							"Error getting wallet outputs: {} Config: {:?}",
+							e, wallet_config
+						)
+					});
 				};
 				Ok(())
 			}

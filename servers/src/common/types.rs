@@ -103,27 +103,6 @@ impl Default for ChainValidationMode {
 	}
 }
 
-/// Type of seeding the server will use to find other peers on the network.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum Seeding {
-	/// No seeding, mostly for tests that programmatically connect
-	None,
-	/// A list of seed addresses provided to the server
-	List,
-	/// Automatically download a text file with a list of server addresses
-	WebStatic,
-	/// Automatically get a list of seeds from multiple DNS
-	DNSSeed,
-	/// Mostly for tests, where connections are initiated programmatically
-	Programmatic,
-}
-
-impl Default for Seeding {
-	fn default() -> Seeding {
-		Seeding::DNSSeed
-	}
-}
-
 /// Full server configuration, aggregating configurations required for the
 /// different components.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -144,19 +123,6 @@ pub struct ServerConfig {
 	/// Automatically run full chain validation during normal block processing?
 	#[serde(default)]
 	pub chain_validation_mode: ChainValidationMode,
-
-	/// Method used to get the list of seed nodes for initial bootstrap.
-	#[serde(default)]
-	pub seeding_type: Seeding,
-
-	/// TODO - move this into p2p_config?
-	/// The list of seed nodes, if using Seeding as a seed type
-	pub seeds: Option<Vec<String>>,
-
-	/// TODO - move this into p2p_config?
-	/// Capabilities expose by this node, also conditions which other peers this
-	/// node will have an affinity toward when connection.
-	pub capabilities: p2p::Capabilities,
 
 	/// Configuration for the peer-to-peer server
 	pub p2p_config: p2p::P2PConfig,
@@ -201,9 +167,6 @@ impl Default for ServerConfig {
 		ServerConfig {
 			db_root: ".grin".to_string(),
 			api_http_addr: "127.0.0.1:13413".to_string(),
-			capabilities: p2p::Capabilities::FULL_NODE,
-			seeding_type: Seeding::default(),
-			seeds: None,
 			p2p_config: p2p::P2PConfig::default(),
 			dandelion_config: pool::DandelionConfig::default(),
 			stratum_mining_config: Some(StratumServerConfig::default()),
@@ -214,7 +177,7 @@ impl Default for ServerConfig {
 			skip_sync_wait: Some(false),
 			run_tui: Some(true),
 			run_wallet_listener: Some(true),
-			run_wallet_owner_api: Some(true),
+			run_wallet_owner_api: Some(false),
 			use_db_wallet: None,
 			run_test_miner: Some(false),
 			test_miner_wallet_url: None,
@@ -336,7 +299,7 @@ impl SyncState {
 	}
 
 	/// Communicate sync error
-	pub fn set_sync_error(&self, error: Error){
+	pub fn set_sync_error(&self, error: Error) {
 		*self.sync_error.write().unwrap() = Some(error);
 	}
 
@@ -346,10 +309,9 @@ impl SyncState {
 	}
 
 	/// Clear sync error
-	pub fn clear_sync_error(&self){
+	pub fn clear_sync_error(&self) {
 		*self.sync_error.write().unwrap() = None;
 	}
-
 }
 
 impl chain::TxHashsetWriteStatus for SyncState {

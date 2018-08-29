@@ -1,4 +1,3 @@
-
 // Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,12 +17,11 @@
 //! header with its proof-of-work.  Any valid mined blocks are submitted to the
 //! network.
 
+use chrono::prelude::Utc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use chrono::prelude::{Utc};
 
 use chain;
-use common::adapters::PoolToChainAdapter;
 use common::types::StratumServerConfig;
 use core::core::hash::{Hash, Hashed};
 use core::core::{Block, BlockHeader, Proof};
@@ -33,13 +31,10 @@ use mining::mine_block;
 use pool;
 use util::LOGGER;
 
-// Max number of transactions this miner will assemble in a block
-const MAX_TX: u32 = 5000;
-
 pub struct Miner {
 	config: StratumServerConfig,
 	chain: Arc<chain::Chain>,
-	tx_pool: Arc<RwLock<pool::TransactionPool<PoolToChainAdapter>>>,
+	tx_pool: Arc<RwLock<pool::TransactionPool>>,
 	stop: Arc<AtomicBool>,
 
 	// Just to hold the port we're on, so this miner can be identified
@@ -53,7 +48,7 @@ impl Miner {
 	pub fn new(
 		config: StratumServerConfig,
 		chain_ref: Arc<chain::Chain>,
-		tx_pool: Arc<RwLock<pool::TransactionPool<PoolToChainAdapter>>>,
+		tx_pool: Arc<RwLock<pool::TransactionPool>>,
 		stop: Arc<AtomicBool>,
 	) -> Miner {
 		Miner {
@@ -153,7 +148,6 @@ impl Miner {
 				&self.chain,
 				&self.tx_pool,
 				key_id.clone(),
-				MAX_TX.clone(),
 				wallet_listener_url.clone(),
 			);
 

@@ -130,14 +130,14 @@ impl TxHashSet {
 	/// Check if an output is unspent.
 	/// We look in the index to find the output MMR pos.
 	/// Then we check the entry in the output MMR and confirm the hash matches.
-	pub fn is_unspent(&mut self, output_id: &OutputIdentifier) -> Result<Hash, Error> {
+	pub fn is_unspent(&mut self, output_id: &OutputIdentifier) -> Result<(Hash, u64), Error> {
 		match self.commit_index.get_output_pos(&output_id.commit) {
 			Ok(pos) => {
 				let output_pmmr: PMMR<OutputIdentifier, _> =
 					PMMR::at(&mut self.output_pmmr_h.backend, self.output_pmmr_h.last_pos);
 				if let Some(hash) = output_pmmr.get_hash(pos) {
 					if hash == output_id.hash_with_index(pos - 1) {
-						Ok(hash)
+						Ok((hash, pos))
 					} else {
 						Err(ErrorKind::TxHashSetErr(format!("txhashset hash mismatch")).into())
 					}
@@ -232,31 +232,34 @@ impl TxHashSet {
 		let horizon = current_height.saturating_sub(global::cut_through_horizon().into());
 		let horizon_header = self.commit_index.get_header_by_height(horizon)?;
 
-		let rewind_rm_pos =
-			input_pos_to_rewind(self.commit_index.clone(), &horizon_header, &head_header)?;
-
 		let batch = self.commit_index.batch()?;
-		if !rewind_rm_pos.0 {
-			batch.save_block_input_bitmap(&head_header.hash(), &rewind_rm_pos.1)?;
-		}
+
+		let rewind_rm_pos = input_pos_to_rewind(
+			self.commit_index.clone(),
+			&horizon_header,
+			&head_header,
+			&batch,
+		)?;
+
 		{
 			let clean_output_index = |commit: &[u8]| {
-				// do we care if this fails?
 				let _ = batch.delete_output_pos(commit);
 			};
 
 			self.output_pmmr_h.backend.check_compact(
 				horizon_header.output_mmr_size,
-				&rewind_rm_pos.1,
+				&rewind_rm_pos,
 				clean_output_index,
 			)?;
 
 			self.rproof_pmmr_h.backend.check_compact(
 				horizon_header.output_mmr_size,
-				&rewind_rm_pos.1,
+				&rewind_rm_pos,
 				&prune_noop,
 			)?;
 		}
+
+		// Finally commit the batch, saving everything to the db.
 		batch.commit()?;
 
 		Ok(())
@@ -449,11 +452,7 @@ impl<'a> Extension<'a> {
 		kernel_pos: u64,
 		rewind_rm_pos: &Bitmap,
 	) -> Result<(), Error> {
-		self.rewind_to_pos(
-			output_pos,
-			kernel_pos,
-			rewind_rm_pos,
-		)?;
+		self.rewind_to_pos(output_pos, kernel_pos, rewind_rm_pos)?;
 		Ok(())
 	}
 
@@ -466,7 +465,10 @@ impl<'a> Extension<'a> {
 	/// new tx).
 	pub fn apply_raw_tx(&mut self, tx: &Transaction) -> Result<(), Error> {
 		// This should *never* be called on a writeable extension...
-		assert!(self.rollback, "applied raw_tx to writeable txhashset extension");
+		assert!(
+			self.rollback,
+			"applied raw_tx to writeable txhashset extension"
+		);
 
 		// Checkpoint the MMR positions before we apply the new tx,
 		// anything goes wrong we will rewind to these positions.
@@ -474,27 +476,28 @@ impl<'a> Extension<'a> {
 		let kernel_pos = self.kernel_pmmr.unpruned_size();
 
 		// Build bitmap of output pos spent (as inputs) by this tx for rewind.
-		let rewind_rm_pos = tx.inputs
+		let rewind_rm_pos = tx
+			.inputs()
 			.iter()
 			.filter_map(|x| self.get_output_pos(&x.commitment()).ok())
 			.map(|x| x as u32)
 			.collect();
 
-		for ref output in &tx.outputs {
+		for ref output in tx.outputs() {
 			if let Err(e) = self.apply_output(output) {
 				self.rewind_raw_tx(output_pos, kernel_pos, &rewind_rm_pos)?;
 				return Err(e);
 			}
 		}
 
-		for ref input in &tx.inputs {
+		for ref input in tx.inputs() {
 			if let Err(e) = self.apply_input(input) {
 				self.rewind_raw_tx(output_pos, kernel_pos, &rewind_rm_pos)?;
 				return Err(e);
 			}
 		}
 
-		for ref kernel in &tx.kernels {
+		for ref kernel in tx.kernels() {
 			if let Err(e) = self.apply_kernel(kernel) {
 				self.rewind_raw_tx(output_pos, kernel_pos, &rewind_rm_pos)?;
 				return Err(e);
@@ -591,15 +594,15 @@ impl<'a> Extension<'a> {
 		// A block is not valid if it has not been fully cut-through.
 		// So we can safely apply outputs first (we will not spend these in the same
 		// block).
-		for out in &b.outputs {
+		for out in b.outputs() {
 			self.apply_output(out)?;
 		}
 
-		for input in &b.inputs {
+		for input in b.inputs() {
 			self.apply_input(input)?;
 		}
 
-		for kernel in &b.kernels {
+		for kernel in b.kernels() {
 			self.apply_kernel(kernel)?;
 		}
 
@@ -671,7 +674,8 @@ impl<'a> Extension<'a> {
 			}
 		}
 		// push new outputs in their MMR and save them in the index
-		let pos = self.output_pmmr
+		let pos = self
+			.output_pmmr
 			.push(OutputIdentifier::from_output(out))
 			.map_err(&ErrorKind::TxHashSetErr)?;
 		self.batch.save_output_pos(&out.commitment(), pos)?;
@@ -711,12 +715,12 @@ impl<'a> Extension<'a> {
 		);
 
 		// rewind to the specified block for a consistent view
-		let head_header = self.commit_index.head_header()?;
-		self.rewind(block_header, &head_header)?;
+		self.rewind(block_header)?;
 
 		// then calculate the Merkle Proof based on the known pos
 		let pos = self.batch.get_output_pos(&output.commit)?;
-		let merkle_proof = self.output_pmmr
+		let merkle_proof = self
+			.output_pmmr
 			.merkle_proof(pos)
 			.map_err(&ErrorKind::TxHashSetErr)?;
 
@@ -740,11 +744,7 @@ impl<'a> Extension<'a> {
 
 	/// Rewinds the MMRs to the provided block, rewinding to the last output pos
 	/// and last kernel pos of that block.
-	pub fn rewind(
-		&mut self,
-		block_header: &BlockHeader,
-		head_header: &BlockHeader,
-	) -> Result<(), Error> {
+	pub fn rewind(&mut self, block_header: &BlockHeader) -> Result<(), Error> {
 		trace!(
 			LOGGER,
 			"Rewind to header {} @ {}",
@@ -752,23 +752,25 @@ impl<'a> Extension<'a> {
 			block_header.hash(),
 		);
 
+		let head_header = self.commit_index.head_header()?;
+
 		// We need to build bitmaps of added and removed output positions
 		// so we can correctly rewind all operations applied to the output MMR
 		// after the position we are rewinding to (these operations will be
 		// undone during rewind).
 		// Rewound output pos will be removed from the MMR.
 		// Rewound input (spent) pos will be added back to the MMR.
-		let rewind_rm_pos =
-			input_pos_to_rewind(self.commit_index.clone(), block_header, head_header)?;
-		if !rewind_rm_pos.0 {
-			self.batch
-				.save_block_input_bitmap(&head_header.hash(), &rewind_rm_pos.1)?;
-		}
+		let rewind_rm_pos = input_pos_to_rewind(
+			self.commit_index.clone(),
+			block_header,
+			&head_header,
+			&self.batch,
+		)?;
 
 		self.rewind_to_pos(
 			block_header.output_mmr_size,
 			block_header.kernel_mmr_size,
-			&rewind_rm_pos.1,
+			&rewind_rm_pos,
 		)
 	}
 
@@ -864,15 +866,12 @@ impl<'a> Extension<'a> {
 	}
 
 	/// Validate the txhashset state against the provided block header.
-	pub fn validate<T>(
+	pub fn validate(
 		&mut self,
 		header: &BlockHeader,
 		skip_rproofs: bool,
-		status: &T,
-	) -> Result<((Commitment, Commitment)), Error>
-	where
-		T: TxHashsetWriteStatus,
-	{
+		status: &TxHashsetWriteStatus,
+	) -> Result<((Commitment, Commitment)), Error> {
 		self.validate_mmrs()?;
 		self.validate_roots(header)?;
 
@@ -950,10 +949,7 @@ impl<'a> Extension<'a> {
 		)
 	}
 
-	fn verify_kernel_signatures<T>(&self, status: &T) -> Result<(), Error>
-	where
-		T: TxHashsetWriteStatus,
-	{
+	fn verify_kernel_signatures(&self, status: &TxHashsetWriteStatus) -> Result<(), Error> {
 		let now = Instant::now();
 
 		let mut kern_count = 0;
@@ -981,11 +977,11 @@ impl<'a> Extension<'a> {
 		Ok(())
 	}
 
-	fn verify_rangeproofs<T>(&self, status: &T) -> Result<(), Error>
-	where
-		T: TxHashsetWriteStatus,
-	{
+	fn verify_rangeproofs(&self, status: &TxHashsetWriteStatus) -> Result<(), Error> {
 		let now = Instant::now();
+
+		let mut commits: Vec<Commitment> = vec![];
+		let mut proofs: Vec<RangeProof> = vec![];
 
 		let mut proof_count = 0;
 		let total_rproofs = pmmr::n_leaves(self.output_pmmr.unpruned_size());
@@ -993,14 +989,18 @@ impl<'a> Extension<'a> {
 			if pmmr::is_leaf(n) {
 				if let Some(out) = self.output_pmmr.get_data(n) {
 					if let Some(rp) = self.rproof_pmmr.get_data(n) {
-						out.into_output(rp).verify_proof()?;
+						commits.push(out.commit);
+						proofs.push(rp);
 					} else {
 						// TODO - rangeproof not found
 						return Err(ErrorKind::OutputNotFound.into());
 					}
 					proof_count += 1;
 
-					if proof_count % 500 == 0 {
+					if proofs.len() >= 1000 {
+						Output::batch_verify_proofs(&commits, &proofs)?;
+						commits.clear();
+						proofs.clear();
 						debug!(
 							LOGGER,
 							"txhashset: verify_rangeproofs: verified {} rangeproofs", proof_count,
@@ -1012,6 +1012,18 @@ impl<'a> Extension<'a> {
 				status.on_validation(0, 0, proof_count, total_rproofs);
 			}
 		}
+
+		// remaining part which not full of 1000 range proofs
+		if proofs.len() > 0 {
+			Output::batch_verify_proofs(&commits, &proofs)?;
+			commits.clear();
+			proofs.clear();
+			debug!(
+				LOGGER,
+				"txhashset: verify_rangeproofs: verified {} rangeproofs", proof_count,
+			);
+		}
+
 		debug!(
 			LOGGER,
 			"txhashset: verified {} rangeproofs, pmmr size {}, took {}s",
@@ -1028,7 +1040,10 @@ impl<'a> Extension<'a> {
 	/// fast sync where a reorg past the horizon could allow a whole rewrite of
 	/// the kernel set.
 	pub fn validate_kernel_history(&mut self, header: &BlockHeader) -> Result<(), Error> {
-		assert!(self.rollback, "verified kernel history on writeable txhashset extension");
+		assert!(
+			self.rollback,
+			"verified kernel history on writeable txhashset extension"
+		);
 
 		let mut current = header.clone();
 		loop {
@@ -1049,7 +1064,6 @@ impl<'a> Extension<'a> {
 		}
 		Ok(())
 	}
-
 }
 
 /// Packages the txhashset data files into a zip and returns a Read to the
@@ -1066,7 +1080,7 @@ pub fn zip_read(root_dir: String, header: &BlockHeader) -> Result<File, Error> {
 			fs::remove_dir_all(&temp_txhashset_path)?;
 		}
 		// Copy file to another dir
-		file::copy_dir_to(&txhashset_path,&temp_txhashset_path)?;
+		file::copy_dir_to(&txhashset_path, &temp_txhashset_path)?;
 		// Check and remove file that are not supposed to be there
 		check_and_remove_files(&temp_txhashset_path, header)?;
 		// Compress zip
@@ -1081,7 +1095,11 @@ pub fn zip_read(root_dir: String, header: &BlockHeader) -> Result<File, Error> {
 
 /// Extract the txhashset data from a zip file and writes the content into the
 /// txhashset storage dir
-pub fn zip_write(root_dir: String, txhashset_data: File, header: &BlockHeader) -> Result<(), Error> {
+pub fn zip_write(
+	root_dir: String,
+	txhashset_data: File,
+	header: &BlockHeader,
+) -> Result<(), Error> {
 	let txhashset_path = Path::new(&root_dir).join(TXHASHSET_SUBDIR);
 	fs::create_dir_all(txhashset_path.clone())?;
 	zip::decompress(txhashset_data, &txhashset_path)
@@ -1115,7 +1133,10 @@ fn check_and_remove_files(txhashset_path: &PathBuf, header: &BlockHeader) -> Res
 
 	// Removing unexpected directories if needed
 	if !dir_difference.is_empty() {
-		debug!(LOGGER, "Unexpected folder(s) found in txhashset folder, removing.");
+		debug!(
+			LOGGER,
+			"Unexpected folder(s) found in txhashset folder, removing."
+		);
 		for diff in dir_difference {
 			let diff_path = txhashset_path.join(diff);
 			file::delete(diff_path)?;
@@ -1126,9 +1147,13 @@ fn check_and_remove_files(txhashset_path: &PathBuf, header: &BlockHeader) -> Res
 	let pmmr_files_expected: HashSet<_> = PMMR_FILES
 		.iter()
 		.cloned()
-		.map(|s| if s.contains("pmmr_leaf.bin") {
-		format!("{}.{}", s, header.hash())}
-		else {String::from(s) })
+		.map(|s| {
+			if s.contains("pmmr_leaf.bin") {
+				format!("{}.{}", s, header.hash())
+			} else {
+				String::from(s)
+			}
+		})
 		.collect();
 
 	let subdirectories = fs::read_dir(txhashset_path)?;
@@ -1149,7 +1174,11 @@ fn check_and_remove_files(txhashset_path: &PathBuf, header: &BlockHeader) -> Res
 			.cloned()
 			.collect();
 		if !difference.is_empty() {
-			debug!(LOGGER, "Unexpected file(s) found in txhashset subfolder {:?}, removing.", &subdirectory_path);
+			debug!(
+				LOGGER,
+				"Unexpected file(s) found in txhashset subfolder {:?}, removing.",
+				&subdirectory_path
+			);
 			for diff in difference {
 				let diff_path = subdirectory_path.join(diff);
 				file::delete(diff_path)?;
@@ -1168,10 +1197,21 @@ fn input_pos_to_rewind(
 	commit_index: Arc<ChainStore>,
 	block_header: &BlockHeader,
 	head_header: &BlockHeader,
-) -> Result<(bool, Bitmap), Error> {
+	batch: &Batch,
+) -> Result<Bitmap, Error> {
 	let mut bitmap = Bitmap::create();
 	let mut current = head_header.hash();
-	let mut found = false;
+
+	if head_header.height < block_header.height {
+		debug!(
+			LOGGER,
+			"input_pos_to_rewind: {} < {}, nothing to rewind",
+			head_header.height,
+			block_header.height
+		);
+		return Ok(bitmap);
+	}
+
 	loop {
 		if current == block_header.hash() {
 			break;
@@ -1182,12 +1222,11 @@ fn input_pos_to_rewind(
 		// I/O should be minimized or eliminated here for most
 		// rewind scenarios.
 		let current_header = commit_index.get_block_header(&current)?;
-		let input_bitmap_res = commit_index.get_block_input_bitmap(&current);
+		let input_bitmap_res = batch.get_block_input_bitmap(&current);
 		if let Ok(b) = input_bitmap_res {
-			found = b.0;
-			bitmap.or_inplace(&b.1);
+			bitmap.or_inplace(&b);
 		}
 		current = current_header.previous;
 	}
-	Ok((found, bitmap))
+	Ok(bitmap)
 }

@@ -24,14 +24,16 @@ use std::sync::{Arc, Mutex};
 
 use serde_json as json;
 
+use core::core::hash::Hashed;
 use core::ser;
 use keychain::Keychain;
 use libtx::slate::Slate;
-use libwallet::internal::{tx, updater, selection, sigcontext};
+use libwallet::internal::{selection, tx, updater};
 use libwallet::types::{
 	BlockFees, CbData, OutputData, TxLogEntry, TxWrapper, WalletBackend, WalletClient, WalletInfo,
 };
 use libwallet::{Error, ErrorKind};
+use util::secp::pedersen;
 use util::{self, LOGGER};
 
 /// Wrapper around internal API functions, containing a reference to
@@ -72,7 +74,7 @@ where
 		include_spent: bool,
 		refresh_from_node: bool,
 		tx_id: Option<u32>,
-	) -> Result<(bool, Vec<OutputData>), Error> {
+	) -> Result<(bool, Vec<(OutputData, pedersen::Commitment)>), Error> {
 		let mut w = self.wallet.lock().unwrap();
 		w.open_with_credentials()?;
 
@@ -138,6 +140,7 @@ where
 		minimum_confirmations: u64,
 		dest: &str,
 		max_outputs: usize,
+		num_change_outputs: usize,
 		selection_strategy_is_use_all: bool,
 	) -> Result<Slate, Error> {
 		let mut w = self.wallet.lock().unwrap();
@@ -153,6 +156,7 @@ where
 			amount,
 			minimum_confirmations,
 			max_outputs,
+			num_change_outputs,
 			selection_strategy_is_use_all,
 		)?;
 
@@ -185,6 +189,7 @@ where
 		minimum_confirmations: u64,
 		dest: &str,
 		max_outputs: usize,
+		num_change_outputs: usize,
 		selection_strategy_is_use_all: bool,
 	) -> Result<(), Error> {
 		let mut w = self.wallet.lock().unwrap();
@@ -195,15 +200,19 @@ where
 			amount,
 			minimum_confirmations,
 			max_outputs,
+			num_change_outputs,
 			selection_strategy_is_use_all,
 		)?;
 
 		let mut pub_tx = File::create(dest)?;
 		pub_tx.write_all(json::to_string(&slate).unwrap().as_bytes())?;
 		pub_tx.sync_all()?;
-		let mut priv_tx = File::create(dest.to_owned() + ".private")?;
-		priv_tx.write_all(json::to_string(&context).unwrap().as_bytes())?;
-		priv_tx.sync_all()?;
+
+		{
+			let mut batch = w.batch()?;
+			batch.save_private_context(slate.id.as_bytes(), &context)?;
+			batch.commit()?;
+		}
 
 		// lock our inputs
 		lock_fn(&mut **w)?;
@@ -214,11 +223,7 @@ where
 	/// A sender provided a transaction file with appropriate public keys and
 	/// metadata. Complete the receivers' end of it to generate another file
 	/// to send back.
-	pub fn file_receive_tx(
-		&mut self,
-		source: &str,
-	) -> Result<(), Error> {
-
+	pub fn file_receive_tx(&mut self, source: &str) -> Result<(), Error> {
 		let mut pub_tx_f = File::open(source)?;
 		let mut content = String::new();
 		pub_tx_f.read_to_string(&mut content)?;
@@ -237,7 +242,7 @@ where
 			&mut context.sec_key,
 			&context.sec_nonce,
 			1,
-			)?;
+		)?;
 
 		// perform partial sig
 		let _ = slate.fill_round_2(wallet.keychain(), &context.sec_key, &context.sec_nonce, 1)?;
@@ -257,7 +262,6 @@ where
 	/// propagation.
 	pub fn file_finalize_tx(
 		&mut self,
-		private_tx_file: &str,
 		receiver_file: &str,
 	) -> Result<Slate, Error> {
 
@@ -266,15 +270,16 @@ where
 		pub_tx_f.read_to_string(&mut content)?;
 		let mut slate: Slate = json::from_str(&content).map_err(|_| ErrorKind::Format)?;
 
-		let mut priv_tx_f = File::open(private_tx_file)?;
-		let mut content = String::new();
-		priv_tx_f.read_to_string(&mut content)?;
-		let context: sigcontext::Context = json::from_str(&content).map_err(|_| ErrorKind::Format)?;
-
 		let mut w = self.wallet.lock().unwrap();
 		w.open_with_credentials()?;
 
+		let context = w.get_private_context(slate.id.as_bytes())?;
 		tx::complete_tx(&mut **w, &mut slate, &context)?;
+		{
+			let mut batch = w.batch()?;
+			batch.delete_private_context(slate.id.as_bytes())?;
+			batch.commit()?;
+		}
 
 		w.close()?;
 		Ok(slate)
@@ -321,8 +326,19 @@ where
 			let mut w = self.wallet.lock().unwrap();
 			w.client().clone()
 		};
-		client.post_tx(&TxWrapper { tx_hex: tx_hex }, fluff)?;
-		Ok(())
+		let res = client.post_tx(&TxWrapper { tx_hex: tx_hex }, fluff);
+		if let Err(e) = res {
+			error!(LOGGER, "api: post_tx: failed with error: {}", e);
+			Err(e)
+		} else {
+			debug!(
+				LOGGER,
+				"api: post_tx: successfully posted tx: {}, fluff? {}",
+				slate.tx.hash(),
+				fluff
+			);
+			Ok(())
+		}
 	}
 
 	/// Attempt to restore contents of wallet
@@ -349,7 +365,7 @@ where
 			}
 			Err(_) => {
 				let outputs = self.retrieve_outputs(true, false, None)?;
-				let height = match outputs.1.iter().map(|out| out.height).max() {
+				let height = match outputs.1.iter().map(|(out, _)| out.height).max() {
 					Some(height) => height,
 					None => 0,
 				};
@@ -414,6 +430,17 @@ where
 		w.open_with_credentials()?;
 		let res = tx::receive_tx(&mut **w, slate);
 		w.close()?;
-		res
+
+		if let Err(e) = res {
+			error!(LOGGER, "api: receive_tx: failed with error: {}", e);
+			Err(e)
+		} else {
+			debug!(
+				LOGGER,
+				"api: receive_tx: successfully received tx: {}",
+				slate.tx.hash()
+			);
+			Ok(())
+		}
 	}
 }

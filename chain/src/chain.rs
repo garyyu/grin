@@ -250,7 +250,7 @@ impl Chain {
 				// block got accepted but we did not extend the head
 				// so its on a fork (or is the start of a new fork)
 				// broadcast the block out so everyone knows about the fork
-					// broadcast the block
+				// broadcast the block
 				self.adapter.block_accepted(&b, opts);
 
 				Ok((None, Some(b)))
@@ -379,7 +379,7 @@ impl Chain {
 		trace!(
 			LOGGER,
 			"chain: done check_orphans at {}. # remaining orphans {}",
-			height-1,
+			height - 1,
 			self.orphans.len(),
 		);
 	}
@@ -391,7 +391,11 @@ impl Chain {
 	/// work) fork.
 	pub fn is_unspent(&self, output_ref: &OutputIdentifier) -> Result<Hash, Error> {
 		let mut txhashset = self.txhashset.write().unwrap();
-		txhashset.is_unspent(output_ref)
+		let res = txhashset.is_unspent(output_ref);
+		match res {
+			Err(e) => Err(e),
+			Ok((h, _)) => Ok(h),
+		}
 	}
 
 	fn next_block_height(&self) -> Result<u64, Error> {
@@ -399,7 +403,8 @@ impl Chain {
 		Ok(bh.height + 1)
 	}
 
-	/// Validate a vec of "raw" transactions against the current chain state.
+	/// Validate a vec of "raw" transactions against a known chain state
+	/// at the block with the specified block hash.
 	/// Specifying a "pre_tx" if we need to adjust the state, for example when
 	/// validating the txs in the stempool we adjust the state based on the
 	/// txpool.
@@ -407,9 +412,14 @@ impl Chain {
 		&self,
 		txs: Vec<Transaction>,
 		pre_tx: Option<Transaction>,
+		block_hash: &Hash,
 	) -> Result<Vec<Transaction>, Error> {
+		// Get header so we can rewind chain state correctly.
+		let header = self.store.get_block_header(block_hash)?;
+
 		let mut txhashset = self.txhashset.write().unwrap();
 		txhashset::extending_readonly(&mut txhashset, |extension| {
+			extension.rewind(&header)?;
 			let valid_txs = extension.validate_raw_txs(txs, pre_tx)?;
 			Ok(valid_txs)
 		})
@@ -421,7 +431,7 @@ impl Chain {
 		let height = self.next_block_height()?;
 		let mut txhashset = self.txhashset.write().unwrap();
 		txhashset::extending_readonly(&mut txhashset, |extension| {
-			extension.verify_coinbase_maturity(&tx.inputs, height)?;
+			extension.verify_coinbase_maturity(&tx.inputs(), height)?;
 			Ok(())
 		})
 	}
@@ -452,7 +462,7 @@ impl Chain {
 		// latest block header. Rewind the extension to the specified header to
 		// ensure the view is consistent.
 		txhashset::extending_readonly(&mut txhashset, |extension| {
-			extension.rewind(&header, &header)?;
+			extension.rewind(&header)?;
 			extension.validate(&header, skip_rproofs, &NoStatus)?;
 			Ok(())
 		})
@@ -518,11 +528,10 @@ impl Chain {
 		// The fast sync client does *not* have the necessary data
 		// to rewind after receiving the txhashset zip.
 		let header = self.store.get_block_header(&h)?;
-		let head_header = self.store.head_header()?;
 		{
 			let mut txhashset = self.txhashset.write().unwrap();
 			txhashset::extending_readonly(&mut txhashset, |extension| {
-				extension.rewind(&header, &head_header)?;
+				extension.rewind(&header)?;
 				extension.snapshot(&header)?;
 				Ok(())
 			})?;
@@ -541,15 +550,12 @@ impl Chain {
 	/// If we're willing to accept that new state, the data stream will be
 	/// read as a zip file, unzipped and the resulting state files should be
 	/// rewound to the provided indexes.
-	pub fn txhashset_write<T>(
+	pub fn txhashset_write(
 		&self,
 		h: Hash,
 		txhashset_data: File,
-		status: &T,
-	) -> Result<(), Error>
-	where
-		T: TxHashsetWriteStatus,
-	{
+		status: &TxHashsetWriteStatus,
+	) -> Result<(), Error> {
 		status.on_setup();
 		let head = self.head().unwrap();
 		let header_head = self.get_header_head().unwrap();
@@ -566,9 +572,12 @@ impl Chain {
 		// Validate against a read-only extension first.
 		// The kernel history validation requires a read-only extension
 		// due to the internal rewind behavior.
-		debug!(LOGGER, "chain: txhashset_write: rewinding and validating (read-only)");
+		debug!(
+			LOGGER,
+			"chain: txhashset_write: rewinding and validating (read-only)"
+		);
 		txhashset::extending_readonly(&mut txhashset, |extension| {
-			extension.rewind(&header, &header)?;
+			extension.rewind(&header)?;
 			extension.validate(&header, false, status)?;
 
 			// Now validate kernel sums at each historical header height
@@ -579,15 +588,21 @@ impl Chain {
 		})?;
 
 		// all good, prepare a new batch and update all the required records
-		debug!(LOGGER, "chain: txhashset_write: rewinding a 2nd time (writeable)");
+		debug!(
+			LOGGER,
+			"chain: txhashset_write: rewinding a 2nd time (writeable)"
+		);
 		let mut batch = self.store.batch()?;
 		txhashset::extending(&mut txhashset, &mut batch, |extension| {
-			extension.rewind(&header, &header)?;
+			extension.rewind(&header)?;
 			extension.rebuild_index()?;
 			Ok(())
 		})?;
 
-		debug!(LOGGER, "chain: txhashset_write: finished validating and rebuilding");
+		debug!(
+			LOGGER,
+			"chain: txhashset_write: finished validating and rebuilding"
+		);
 
 		status.on_save();
 		// replace the chain txhashset with the newly built one
@@ -605,7 +620,10 @@ impl Chain {
 		}
 		batch.commit()?;
 
-		debug!(LOGGER, "chain: txhashset_write: finished committing the batch (head etc.)");
+		debug!(
+			LOGGER,
+			"chain: txhashset_write: finished committing the batch (head etc.)"
+		);
 
 		self.check_orphans(header.height + 1);
 
@@ -790,6 +808,36 @@ impl Chain {
 			.map_err(|e| ErrorKind::StoreErr(e, "chain get header by height".to_owned()).into())
 	}
 
+	/// Gets the block header in which a given output appears in the txhashset
+	pub fn get_header_for_output(
+		&self,
+		output_ref: &OutputIdentifier,
+	) -> Result<BlockHeader, Error> {
+		let mut txhashset = self.txhashset.write().unwrap();
+		let (_, pos) = txhashset.is_unspent(output_ref)?;
+		let mut min = 1;
+		let mut max = {
+			let h = self.head.lock().unwrap();
+			h.height
+		};
+
+		loop {
+			let search_height = max - (max - min) / 2;
+			let h = self.get_header_by_height(search_height)?;
+			let h_prev = self.get_header_by_height(search_height - 1)?;
+			if pos > h.output_mmr_size {
+				min = search_height;
+			} else if pos < h_prev.output_mmr_size {
+				max = search_height;
+			} else {
+				if pos == h_prev.output_mmr_size {
+					return Ok(h_prev);
+				}
+				return Ok(h);
+			}
+		}
+	}
+
 	/// Verifies the given block header is actually on the current chain.
 	/// Checks the header_by_height index to verify the header is where we say
 	/// it is
@@ -842,7 +890,6 @@ fn setup_head(
 	match head_res {
 		Ok(h) => {
 			head = h;
-			let head_header = store.head_header()?;
 			loop {
 				// Use current chain tip if we have one.
 				// Note: We are rewinding and validating against a writeable extension.
@@ -851,7 +898,7 @@ fn setup_head(
 				let header = store.get_block_header(&head.last_block_h)?;
 
 				let res = txhashset::extending(txhashset, &mut batch, |extension| {
-					extension.rewind(&header, &head_header)?;
+					extension.rewind(&header)?;
 					extension.validate_roots(&header)?;
 					debug!(
 						LOGGER,
