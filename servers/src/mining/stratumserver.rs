@@ -834,7 +834,6 @@ where
 
 /// Utility function to check whether some mined blocks are in fork (invalid blocks)
 fn run_fork_check(chain: Arc<chain::Chain>, stratum_stats: Arc<RwLock<StratumStats>>) {
-
 	let mut prev_height = 0;
 	loop {
 		// get the latest chain state

@@ -241,7 +241,7 @@ impl Default for StratumStats {
 			edge_bits: 29,
 			worker_stats: Vec::new(),
 			initial_block_height: 0,
-			num_share_accepted: (0,0,0),
+			num_share_accepted: (0, 0, 0),
 			num_blocks_found: 0,
 			num_forks_found: 0,
 			mined_blocks: Vec::new(),
