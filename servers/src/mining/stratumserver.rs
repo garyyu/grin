@@ -841,7 +841,7 @@ fn run_fork_check(chain: Arc<chain::Chain>, stratum_stats: Arc<RwLock<StratumSta
 		let current_height = head.height;
 
 		// checking every 8 blocks
-		let height_changed = prev_height == current_height;
+		let height_changed = prev_height != current_height;
 		if current_height & 7 == 0 && height_changed {
 			prev_height = current_height;
 
