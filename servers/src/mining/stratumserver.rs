@@ -834,16 +834,15 @@ where
 
 /// Utility function to check whether some mined blocks are in fork (invalid blocks)
 fn run_fork_check(chain: Arc<chain::Chain>, stratum_stats: Arc<RwLock<StratumStats>>) {
-	let mut prev_height = 0;
+	let mut next_height = 0;
 	loop {
 		// get the latest chain state
 		let head = chain.head().unwrap();
 		let current_height = head.height;
 
-		// checking every 8 blocks
-		let height_changed = prev_height != current_height;
-		if current_height & 7 == 0 && height_changed {
-			prev_height = current_height;
+		// checking every 5 blocks
+		if current_height >= next_height {
+			next_height = current_height + 5;
 
 			let (mined_blocks, num_share_accepted) = {
 				let stratum_stats = stratum_stats.read();
