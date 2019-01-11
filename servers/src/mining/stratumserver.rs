@@ -956,11 +956,19 @@ fn run_fork_check(chain: Arc<chain::Chain>, stratum_stats: Arc<RwLock<StratumSta
 
 				let s = num_share_accepted.0 as f64;
 				let x = s / (y * 3600.0) * 5.0 / 0.118;
-				let g_ar = (54.0 * x * y) / num_valid_blocks.0 as f64;
+				let g_ar = if num_valid_blocks.0 == 0 {
+					0.0
+				} else {
+					(54.0 * x * y) / num_valid_blocks.0 as f64
+				};
 
 				let s = num_share_accepted.1 as f64;
 				let x = s / (y * 3600.0) * 0.6 / 0.016;
-				let g_at = (6.0 * x * y) / num_valid_blocks.1 as f64;
+				let g_at = if num_valid_blocks.1 == 0 {
+					0.0
+				} else {
+					(6.0 * x * y) / num_valid_blocks.1 as f64
+				};
 
 				debug!(
 					"run_fork_check - Network GPS estimation: (AR: {:.2?}, AT: {:.2?})",
