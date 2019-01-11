@@ -103,6 +103,17 @@ pub struct StratumStats {
 	pub edge_bits: u16,
 	/// Individual worker status
 	pub worker_stats: Vec<WorkerStats>,
+
+	/// which block height it starts mining
+	pub initial_block_height: u64,
+	/// number of valid shares (AR29, AT31, AT32)
+	pub num_share_accepted: (u64, u64, u64),
+	/// number of valid blocks found
+	pub num_blocks_found: u64,
+	/// number of invalid blocks found
+	pub num_forks_found: u64,
+	/// mined blocks (height, hash, fork, edge_bits)
+	pub mined_blocks: Vec<(u64, Hash, bool, u8)>,
 }
 
 /// Stats on the last WINDOW blocks and the difficulty calculation
@@ -229,6 +240,11 @@ impl Default for StratumStats {
 			network_difficulty: 1000,
 			edge_bits: 29,
 			worker_stats: Vec::new(),
+			initial_block_height: 0,
+			num_share_accepted: (0,0,0),
+			num_blocks_found: 0,
+			num_forks_found: 0,
+			mined_blocks: Vec::new(),
 		}
 	}
 }

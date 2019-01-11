@@ -321,7 +321,8 @@ impl StratumServer {
 							let res = self.handle_submit(
 								request.params,
 								&mut workers_l[num],
-								&mut stratum_stats.worker_stats[worker_stats_id],
+								worker_stats_id,
+								&mut stratum_stats,
 							);
 							// this key_id has been used now, reset
 							if let Ok((_, true)) = res {
@@ -450,8 +451,10 @@ impl StratumServer {
 		&self,
 		params: Option<Value>,
 		worker: &mut Worker,
-		worker_stats: &mut WorkerStats,
+		worker_stats_id: usize,
+		stratum_stats: &mut StratumStats,
 	) -> Result<(Value, bool), Value> {
+		let worker_stats = &mut stratum_stats.worker_stats[worker_stats_id];
 		// Validate parameters
 		let params: SubmitParams = parse_params(params)?;
 
@@ -587,9 +590,26 @@ impl StratumServer {
 			submitted_by,
 		);
 		worker_stats.num_accepted += 1;
+		match b.header.pow.proof.edge_bits {
+			29 => stratum_stats.num_share_accepted.0 += 1,
+			31 => stratum_stats.num_share_accepted.1 += 1,
+			_ => stratum_stats.num_share_accepted.2 += 1,
+		}
+
+		if stratum_stats.initial_block_height == 0 {
+			stratum_stats.initial_block_height = stratum_stats.block_height;
+		}
+
 		let submit_response;
 		if share_is_block {
 			submit_response = format!("blockfound - {}", b.hash().to_hex());
+			stratum_stats.num_blocks_found += 1;
+			stratum_stats.mined_blocks.push((
+				b.header.height,
+				b.hash(),
+				false,
+				b.header.pow.proof.edge_bits,
+			));
 		} else {
 			submit_response = "ok".to_string();
 		}
@@ -723,6 +743,14 @@ impl StratumServer {
 			thread::sleep(Duration::from_millis(50));
 		}
 
+		let chain_clone = self.chain.clone();
+		let stratum_stats_clone = stratum_stats.clone();
+		let _ = thread::Builder::new()
+			.name("stratum_fork_check".to_string())
+			.spawn(move || {
+				run_fork_check(chain_clone, stratum_stats_clone);
+			});
+
 		// Main Loop
 		loop {
 			// Remove workers with failed connections
@@ -782,7 +810,7 @@ impl StratumServer {
 			self.handle_rpc_requests(&mut stratum_stats.clone());
 
 			// sleep before restarting loop
-			thread::sleep(Duration::from_millis(50));
+			thread::sleep(Duration::from_millis(1));
 		} // Main Loop
 	} // fn run_loop()
 } // StratumServer
@@ -802,4 +830,145 @@ where
 			};
 			serde_json::to_value(e).unwrap()
 		})
+}
+
+/// Utility function to check whether some mined blocks are in fork (invalid blocks)
+fn run_fork_check(chain: Arc<chain::Chain>, stratum_stats: Arc<RwLock<StratumStats>>) {
+
+	let mut prev_height = 0;
+	loop {
+		// get the latest chain state
+		let head = chain.head().unwrap();
+		let current_height = head.height;
+
+		// checking every 8 blocks
+		let height_changed = prev_height == current_height;
+		if current_height & 7 == 0 && height_changed {
+			prev_height = current_height;
+
+			let (mined_blocks, num_share_accepted) = {
+				let stratum_stats = stratum_stats.read();
+				(
+					stratum_stats.mined_blocks.clone(),
+					stratum_stats.num_share_accepted,
+				)
+			};
+			let mut index = 0;
+
+			// total valid blocks for edge_bits: 29,31,total
+			let mut num_valid_blocks = (0, 0, 0);
+			let mut num_blocks_found = (0, 0, 0);
+			let mut num_forks_found = (0, 0, 0);
+			for (height, hash, fork, edge_bits) in mined_blocks {
+				index += 1;
+
+				// total found blocks
+				match edge_bits {
+					29 => num_blocks_found.0 += 1,
+					31 => num_blocks_found.1 += 1,
+					_ => (),
+				}
+
+				// old blocks no need checking.
+				// suppose max possible fork depth: 16 blocks!
+				if height + 16 < current_height {
+					// valid blocks and forks
+					if !fork {
+						num_valid_blocks.2 += 1;
+						match edge_bits {
+							29 => num_valid_blocks.0 += 1,
+							31 => num_valid_blocks.1 += 1,
+							_ => (),
+						}
+					} else {
+						num_forks_found.2 += 1;
+						match edge_bits {
+							29 => num_forks_found.0 += 1,
+							31 => num_forks_found.1 += 1,
+							_ => (),
+						}
+					}
+
+					continue;
+				}
+
+				// Forks checking
+				if let Ok(header) = chain.get_header_by_height(height + 1) {
+					if header.prev_hash != hash {
+						if !fork {
+							warn!(
+								"run_fork_check - unfortunately a mined block {} at {}\
+								 is a fork block! 60+ coins gone:(",
+								hash, height,
+							);
+							let mut stratum_stats = stratum_stats.write();
+							stratum_stats.mined_blocks[index - 1].2 = true;
+						}
+						num_forks_found.2 += 1;
+						match edge_bits {
+							29 => num_forks_found.0 += 1,
+							31 => num_forks_found.1 += 1,
+							_ => (),
+						}
+					} else {
+						if fork {
+							warn!(
+								"run_fork_check - Yay! a forked mined block {} at {} \
+								 becomes main chain! 60+ coins come back.",
+								hash, height,
+							);
+							let mut stratum_stats = stratum_stats.write();
+							stratum_stats.mined_blocks[index - 1].2 = false;
+						}
+
+						num_valid_blocks.2 += 1;
+						match edge_bits {
+							29 => num_valid_blocks.0 += 1,
+							31 => num_valid_blocks.1 += 1,
+							_ => (),
+						}
+					}
+				} else {
+					error!(
+						"run_fork_check - get_header_by_height fail on a mined block {} at {}",
+						hash, height,
+					);
+				}
+			}
+
+			{
+				let mut stratum_stats = stratum_stats.write();
+				stratum_stats.num_forks_found = stratum_stats.num_blocks_found - num_valid_blocks.2;
+				debug!("run_fork_check - total mined: (ar29:{},at31:{}), forked: (ar29:{},at31:{}), valid: (ar29:{},at31:{})/{}",
+					   num_blocks_found.0, num_blocks_found.1,
+					   num_forks_found.0, num_forks_found.1,
+					   num_valid_blocks.0, num_valid_blocks.1,
+					   current_height - stratum_stats.initial_block_height,
+				);
+
+				// Network GPS Estimation:
+				//     M cuck(AR)oo blocks + N cuck(AT)oo blocks
+				//     Y is duration (hours)
+				// AR: G = (54 * X * Y) / M
+				//     X = S / (Y * 3600) * 5 / 0.12
+				// AT: G = ( 6 * X * Y) / N
+				//     X = S / (Y * 3600) * 0.6 / 0.016
+				let y = (current_height - stratum_stats.initial_block_height) as f64 / 60.0;
+
+				let s = num_share_accepted.0 as f64;
+				let x = s / (y * 3600.0) * 5.0 / 0.118;
+				let g_ar = (54.0 * x * y) / num_valid_blocks.0 as f64;
+
+				let s = num_share_accepted.1 as f64;
+				let x = s / (y * 3600.0) * 0.6 / 0.016;
+				let g_at = (6.0 * x * y) / num_valid_blocks.1 as f64;
+
+				debug!(
+					"run_fork_check - Network GPS estimation: (AR: {:.2?}, AT: {:.2?})",
+					g_ar, g_at,
+				);
+			}
+		}
+		thread::sleep(Duration::from_secs(60));
+	}
 }
