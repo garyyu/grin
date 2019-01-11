@@ -962,7 +962,7 @@ fn run_fork_check(chain: Arc<chain::Chain>, stratum_stats: Arc<RwLock<StratumSta
 				};
 
 				let s = num_share_accepted.1 as f64;
-				let x = s / (y * 3600.0) * 0.6 / 0.016;
+				let x = s / (y * 3600.0) * 0.6 / 0.0135;
 				let g_at = if num_valid_blocks.1 == 0 {
 					0.0
 				} else {
