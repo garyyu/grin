@@ -867,9 +867,9 @@ fn run_fork_check(chain: Arc<chain::Chain>, stratum_stats: Arc<RwLock<StratumSta
 					_ => (),
 				}
 
-				// old blocks no need checking.
-				// suppose max possible fork depth: 16 blocks!
-				if height + 16 < current_height {
+				// Old blocks no need checking, suppose max possible fork depth: 16 blocks!
+				// and 3 latest blocks can't check!
+				if height + 16 < current_height || height + 3 > current_height {
 					// valid blocks and forks
 					if !fork {
 						num_valid_blocks.2 += 1;
@@ -960,6 +960,7 @@ fn run_fork_check(chain: Arc<chain::Chain>, stratum_stats: Arc<RwLock<StratumSta
 				} else {
 					(54.0 * x * y) / num_valid_blocks.0 as f64
 				};
+				let self_ar = x;
 
 				let s = num_share_accepted.1 as f64;
 				let x = s / (y * 3600.0) * 0.6 / 0.0135;
@@ -968,10 +969,12 @@ fn run_fork_check(chain: Arc<chain::Chain>, stratum_stats: Arc<RwLock<StratumSta
 				} else {
 					(6.0 * x * y) / num_valid_blocks.1 as f64
 				};
+				let self_at = x;
 
 				debug!(
-					"run_fork_check - Network GPS estimation: (AR: {:.2?}, AT: {:.2?})",
+					"run_fork_check - Network GPS estimation: (AR: {:.2?}, AT: {:.2?}). Self GPS: (AR: {:.2?}, AT: {:.2?})",
 					g_ar, g_at,
+					self_ar, self_at,
 				);
 			}
 		}
