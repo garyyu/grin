@@ -257,6 +257,11 @@ impl TxHashSet {
 		}
 	}
 
+	/// Return Commit's MMR position
+	pub fn get_output_pos(&self, commit: &Commitment) -> Result<u64, Error> {
+		Ok(self.commit_index.get_output_pos(&commit)?)
+	}
+
 	/// build a new merkle proof for the given position.
 	pub fn merkle_proof(&mut self, commit: Commitment) -> Result<MerkleProof, String> {
 		let pos = self.commit_index.get_output_pos(&commit).unwrap();
@@ -1451,7 +1456,7 @@ fn check_and_remove_files(txhashset_path: &PathBuf, header: &BlockHeader) -> Res
 	}
 
 	// Then compare the files found in the subdirectories
-	let pmmr_files_expected: HashSet<_> = PMMR_FILES
+	let mut pmmr_files_expected: HashSet<_> = PMMR_FILES
 		.iter()
 		.cloned()
 		.map(|s| {
@@ -1462,6 +1467,8 @@ fn check_and_remove_files(txhashset_path: &PathBuf, header: &BlockHeader) -> Res
 			}
 		})
 		.collect();
+	// prevent checker from deleting 3 dot file, could be removed after mainnet
+	pmmr_files_expected.insert(format!("pmmr_leaf.bin.{}...", header.hash()));
 
 	let subdirectories = fs::read_dir(txhashset_path)?;
 	for subdirectory in subdirectories {
