@@ -20,6 +20,7 @@
 use chrono::prelude::{DateTime, Utc};
 use chrono::{Duration, MIN_DATE};
 use rand::{thread_rng, Rng};
+use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{mpsc, Arc};
 use std::{cmp, str, thread, time};
@@ -76,7 +77,7 @@ pub fn connect_and_monitor(
 			let mut prev_ping = Utc::now();
 			let mut start_attempt = 0;
 
-			let mut connecting_history: Vec<(SocketAddr, DateTime<Utc>)> = Vec::new();
+			let mut connecting_history: HashMap<SocketAddr, DateTime<Utc>> = HashMap::new();
 
 			loop {
 				if stop_state.lock().is_stopped() {
@@ -305,7 +306,7 @@ fn listen_for_addrs(
 	p2p: Arc<p2p::Server>,
 	capab: p2p::Capabilities,
 	rx: &mpsc::Receiver<SocketAddr>,
-	connecting_history: &mut Vec<(SocketAddr, DateTime<Utc>)>,
+	connecting_history: &mut HashMap<SocketAddr, DateTime<Utc>>,
 ) {
 	if peers.peer_count() >= p2p.config.peer_max_count() {
 		// clean the rx messages to avoid accumulating
@@ -313,20 +314,22 @@ fn listen_for_addrs(
 		return;
 	}
 
-	let now = Utc::now();
 	for addr in rx.try_iter() {
 		// ignore the duplicate connecting to same peer within 10 seconds
-		if let Some(pos) = connecting_history.iter().position(|&r| r.0 == addr) {
-			let (_, last_connect_time) = connecting_history[pos];
-			if last_connect_time + Duration::seconds(10) > now {
+		let now = Utc::now();
+		if let Some(last_connect_time) = connecting_history.get(&addr) {
+			if *last_connect_time + Duration::seconds(10) > now {
 				debug!(
-					"peer_connect: ignore a duplicate connect request to {}",
-					addr
+					"peer_connect: ignore a duplicate request to {}. previous connecting time: {}",
+					addr,
+					last_connect_time.format("%H:%M:%S%.3f").to_string(),
 				);
 				continue;
+			} else {
+				*connecting_history.get_mut(&addr).unwrap() = now;
 			}
 		}
-		connecting_history.insert(0, (addr, now));
+		connecting_history.insert(addr, now);
 
 		let peers_c = peers.clone();
 		let p2p_c = p2p.clone();
@@ -337,19 +340,24 @@ fn listen_for_addrs(
 					let _ = p.send_peer_request(capab);
 					let _ = peers_c.update_state(addr, p2p::State::Healthy);
 				}
-				Err(p2p::Error::DuplicateConnection) => (),
 				Err(_) => {
 					let _ = peers_c.update_state(addr, p2p::State::Defunct);
 				}
 			});
 	}
 
-	// shrink the connecting history vector, removing history 60 seconds ago
-	if let Some(pos) = connecting_history
-		.iter()
-		.position(|&r| r.1 + Duration::seconds(60) < now)
-	{
-		connecting_history.truncate(pos);
+	// shrink the connecting history.
+	// put a threshold here to avoid frequent shrinking in every call
+	let now = Utc::now();
+	if connecting_history.len() > 100 {
+		let old: Vec<_> = connecting_history
+			.iter()
+			.filter(|&(_, t)| *t + Duration::seconds(20) < now)
+			.map(|(s, _)| s.clone())
+			.collect();
+		for addr in old {
+			connecting_history.remove(&addr);
+		}
 	}
 }
 
