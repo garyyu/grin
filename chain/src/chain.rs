@@ -1019,7 +1019,7 @@ impl Chain {
 				Err(e) => {
 					return Err(
 						ErrorKind::StoreErr(e, "retrieving block to compact".to_owned()).into(),
-					)
+					);
 				}
 			}
 			if current.height <= 1 {

@@ -93,7 +93,7 @@ pub enum ErrorKind {
 
 	/// API Error
 	#[fail(display = "Client Callback Error: {}", _0)]
-	ClientCallback(&'static str),
+	ClientCallback(String),
 
 	/// Secp Error
 	#[fail(display = "Secp error")]
@@ -112,8 +112,8 @@ pub enum ErrorKind {
 	Restore,
 
 	/// An error in the format of the JSON structures exchanged by the wallet
-	#[fail(display = "JSON format error")]
-	Format,
+	#[fail(display = "JSON format error: {}", _0)]
+	Format(String),
 
 	/// Other serialization errors
 	#[fail(display = "Ser/Deserialization error")]
