@@ -80,7 +80,7 @@ case "${CI_JOB}" in
         [[ "${OS_NAME}" != "linux" ]] && exit 0
 
         # Generate CHANGELOG.md
-        readonly REPO_SLUG="mimblewimble/grin"
+        readonly REPO_SLUG="garyyu/grin"
         readonly REPO_BRANCH="$(git symbolic-ref -q --short HEAD)"
         readonly REPO_PREV_RELEASE_TAG="$(git describe --abbrev=0 --tags "$(git rev-list --tags --skip=0 --max-count=1)")"
 
