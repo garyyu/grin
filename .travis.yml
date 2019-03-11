@@ -65,8 +65,8 @@ matrix:
       env: CI_JOB="release"     CI_JOB_ARGS=
     - os: osx
       env: CI_JOB="release"     CI_JOB_ARGS=
-#    - os: windows
-#      env: CI_JOB="release"     CI_JOB_ARGS=
+    - os: windows
+      env: CI_JOB="release"     CI_JOB_ARGS=
 
 script: .ci/general-jobs
 
